@@ -1523,6 +1523,10 @@ class DBManagerCompat:
     def consume_batch_data(self, card_id: int) -> Optional[str]:
         """消费批量数据卡券的一条数据
 
+        ⚠ 已废弃：旧 data_content 卡密池已停用，卡密统一走明细表
+        （common/services/card_secret_service.take_one，xy_card_secrets）。
+        本函数仅保留作历史参考，新代码禁止调用。
+
         从卡券的 data_content 中取出第一行数据并删除。
 
         并发安全设计（CAS 乐观锁，不依赖行锁与事务隔离级别）：

@@ -35,6 +35,7 @@ interface UnifiedCardItem {
   spec_value?: string
   enabled?: boolean
   price?: string | null
+  stock?: number  // 自有 data 型卡券（卡密分类）的可用库存数
   uniqueKey: string  // 'own_{cardId}' | 'dock_{dockRecordId}'
 }
 
@@ -67,6 +68,7 @@ const toUnified = (sc: SelectableCard): UnifiedCardItem => ({
   spec_value: sc.spec_value,
   enabled: sc.enabled,
   price: sc.price ?? null,
+  stock: sc.stock,
   uniqueKey: sc.unique_key,
 })
 
@@ -343,13 +345,14 @@ export function ItemCardRelationModal({ itemId, itemName, onClose, onSaved }: It
     return <span className="inline-block px-1 py-0.5 mr-1 rounded text-[10px] font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400">二级对接</span>
   }
 
-  // 卡券副标题（来源标签 + 类型/对接名 + 规格 + 禁用）
+  // 卡券副标题（来源标签 + 类型/对接名 + 规格 + 卡密库存 + 禁用）
   const cardSubtitle = (card: UnifiedCardItem, showDisabled: boolean) => (
     <>
       {sourceBadge(card.source)}
       {card.source === 'own' && (cardTypeLabels[card.type] || card.type)}
       {card.source !== 'own' && card.dockName && card.dockName}
       {card.is_multi_spec && ` | ${card.spec_name}: ${card.spec_value}`}
+      {card.source === 'own' && card.type === 'data' && ` | 库存 ${card.stock ?? 0}`}
       {showDisabled && !card.enabled && ' | 已禁用'}
     </>
   )

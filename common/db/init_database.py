@@ -354,6 +354,13 @@ class DatabaseInitializer:
             True,
             "定时查询已私信且未下单的采集商品，用监控任务配置的下单账号创建订单（拍下，不自动付款）",
         ),
+        (
+            "stock_guard",
+            "卡密库存巡检任务",
+            300,
+            True,
+            "卡密库存双保险：空库存商品补下架、补货后联动上架，并消费上下架任务队列",
+        ),
     )
     
     # ========== 所有数据表的DDL定义 ==========
@@ -477,7 +484,7 @@ class DatabaseInitializer:
             CREATE TABLE IF NOT EXISTS xy_catalog_items (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '商品ID',
                 owner_id BIGINT NOT NULL COMMENT '所属用户ID',
-                account_id BIGINT NOT NULL COMMENT '关联账号ID',
+                account_id BIGINT COMMENT '关联账号ID',
                 item_id VARCHAR(64) NOT NULL COMMENT '商品标识',
                 title VARCHAR(255) COMMENT '商品标题',
                 price VARCHAR(32) COMMENT '商品价格',
@@ -1074,6 +1081,25 @@ class DatabaseInitializer:
                 INDEX idx_cir_user_item (user_id, item_id),
                 UNIQUE KEY uk_card_item_dock (card_id, item_id, dock_record_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='卡券商品关联表';
+        """,
+
+        # 28.1 卡密明细表（卡密库存自动上下架方案 §2）
+        "xy_card_secrets": """
+            CREATE TABLE IF NOT EXISTS xy_card_secrets (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                card_id BIGINT NOT NULL COMMENT '关联卡券ID（卡密分类，xy_cards.id）',
+                user_id BIGINT NOT NULL COMMENT '所属用户ID',
+                content TEXT NOT NULL COMMENT '卡密内容：文本卡密存原文；图片卡密存相对URL',
+                content_type TINYINT NOT NULL DEFAULT 0 COMMENT '卡密形态：0=文本 1=二维码图片',
+                image_hash CHAR(32) COMMENT '图片字节MD5（导入去重用；文本卡密为NULL）',
+                status TINYINT NOT NULL DEFAULT 0 COMMENT '状态：0=可用 1=已用 2=作废',
+                order_id VARCHAR(64) COMMENT '消费该卡密的订单号（追溯）',
+                used_at DATETIME COMMENT '使用时间（北京时间）',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                INDEX idx_user_id (user_id),
+                INDEX idx_card_status (card_id, status),
+                INDEX idx_card_hash (card_id, image_hash)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='卡密明细表';
         """,
 
         # 29. 对接记录表
@@ -1865,6 +1891,12 @@ class DatabaseInitializer:
             ("source", "VARCHAR(20) DEFAULT 'own' COMMENT '卡券来源：own-自有，dock_l1-一级对接，dock_l2-二级对接'", "item_id"),
             ("dock_record_id", "BIGINT DEFAULT NULL COMMENT '对接记录ID（对接卡券时关联）'", "source"),
         ],
+        "xy_card_secrets": [
+            ("content_type", "TINYINT NOT NULL DEFAULT 0 COMMENT '卡密形态：0=文本 1=二维码图片'", "content"),
+            ("image_hash", "CHAR(32) COMMENT '图片字节MD5（导入去重用；文本卡密为NULL）'", "content_type"),
+            ("order_id", "VARCHAR(64) COMMENT '消费该卡密的订单号（追溯）'", "status"),
+            ("used_at", "DATETIME COMMENT '使用时间（北京时间）'", "order_id"),
+        ],
         "xy_agent_orders": [
             ("card_price", "VARCHAR(32) DEFAULT NULL COMMENT '卡券成本（货主对接价）'", "dock_price"),
             ("level2_cost", "VARCHAR(32) DEFAULT NULL COMMENT '二级拿货价（一级的sub_dock_price）'", "card_price"),
@@ -1924,6 +1956,9 @@ class DatabaseInitializer:
 
                 # 9. 为历史用户回填分销秘钥（secret_key 为空的存量用户）
                 await self.backfill_user_secret_keys()
+
+                # 10. 迁移存量卡密（xy_cards.data_content 按行拆分到 xy_card_secrets，幂等）
+                await self.migrate_card_secrets()
             
             logger.info("数据库初始化完成")
             logger.info("=" * 50)
@@ -2177,6 +2212,27 @@ class DatabaseInitializer:
                         logger.info("✓ xy_card_item_relations: 创建 uk_card_item_dock 索引")
             except Exception as e:
                 logger.warning(f"✗ 索引迁移失败: {e}")
+
+            # xy_card_secrets: 为已存在的旧表补建复合索引（新表由 DDL 自带）
+            for idx_name, idx_cols in (
+                ("idx_card_status", "(card_id, status)"),
+                ("idx_card_hash", "(card_id, image_hash)"),
+            ):
+                try:
+                    check = text(f"""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_card_secrets'
+                        AND INDEX_NAME = '{idx_name}'
+                    """)
+                    result = await conn.execute(check)
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            f"ALTER TABLE xy_card_secrets ADD INDEX {idx_name} {idx_cols}"
+                        ))
+                        logger.info(f"✓ xy_card_secrets: 创建索引 {idx_name}")
+                except Exception as e:
+                    logger.warning(f"✗ xy_card_secrets 索引 {idx_name} 迁移失败: {e}")
 
             # 为 xy_token_cache 补建到期时间复合索引，降低 20 秒续期扫描开销
             try:
@@ -3567,6 +3623,25 @@ class DatabaseInitializer:
                 
         except Exception as e:
             logger.warning(f"✗ 卡券商品关联数据迁移失败（不影响系统运行）: {e}")
+
+    async def migrate_card_secrets(self):
+        """迁移存量卡密到明细表（幂等，可重复执行）
+
+        把 xy_cards.data_content（每行一条卡密）按文本卡密拆分到 xy_card_secrets，
+        幂等键为 (card_id, content)；迁移不清空旧 data_content。
+        """
+        try:
+            from common.db.migrate_card_secrets import migrate_data_content_to_secrets
+
+            async with async_session_maker() as session:
+                added = await migrate_data_content_to_secrets(session)
+                await session.commit()
+                if added:
+                    logger.info(f"✓ 存量卡密迁移完成：新增明细 {added} 条")
+                else:
+                    logger.debug("✓ 无待迁移的存量卡密")
+        except Exception as e:
+            logger.warning(f"✗ 存量卡密迁移失败（不影响系统运行）: {e}")
 
     async def migrate_delivery_block_rules(self):
         """迁移旧禁止发货设置到规则配置表

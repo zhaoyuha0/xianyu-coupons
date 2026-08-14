@@ -198,10 +198,7 @@ export function CardFormModal({ cardId, initialData, onClose, onSaved }: CardFor
       addToast({ type: 'warning', message: '请输入固定文字内容' })
       return false
     }
-    if (formData.type === 'data' && !formData.dataContent.trim()) {
-      addToast({ type: 'warning', message: '请输入批量数据' })
-      return false
-    }
+    // data 型卡券（卡密分类）：允许先建空分类，之后通过列表的「卡密管理」补货
     if (formData.isMultiSpec && (!formData.specName.trim() || !formData.specValue.trim())) {
       addToast({ type: 'warning', message: '多规格卡券必须填写规格名称和规格值' })
       return false
@@ -475,19 +472,25 @@ export function CardFormModal({ cardId, initialData, onClose, onSaved }: CardFor
               </div>
             )}
 
-            {/* 批量数据配置 */}
+            {/* 批量数据配置（卡密分类） */}
             {formData.type === 'data' && (
               <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                <h3 className="font-medium text-gray-900 dark:text-white mb-3">批量数据配置</h3>
+                <h3 className="font-medium text-gray-900 dark:text-white mb-3">
+                  {isEditMode ? '追加卡密（可选）' : '初始卡密（可选）'}
+                </h3>
                 <div>
-                  <label className="input-label">数据内容 (一行一个)</label>
+                  <label className="input-label">卡密内容 (一行一个)</label>
                   <textarea
                     value={formData.dataContent}
                     onChange={(e) => updateField('dataContent', e.target.value)}
                     className="input-ios h-40 font-mono text-sm"
-                    placeholder="请输入数据，每行一个：&#10;卡号1:密码1&#10;卡号2:密码2&#10;或者&#10;兑换码1&#10;兑换码2"
+                    placeholder="请输入卡密，每行一个：&#10;卡号1:密码1&#10;卡号2:密码2&#10;或者&#10;兑换码1&#10;兑换码2"
                   />
-                  <p className="text-xs text-gray-500 mt-1">支持格式：卡号:密码 或 单独的兑换码</p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {isEditMode
+                      ? '保存时此处内容将追加导入卡密库存（重复自动跳过，不删除已有卡密）；库存与二维码卡密请在列表的「卡密管理」中维护'
+                      : '保存时自动导入卡密库存；创建后可在列表的「卡密管理」中补货（支持二维码图片卡密）'}
+                  </p>
                 </div>
               </div>
             )}

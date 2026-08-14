@@ -1,4 +1,4 @@
-﻿"""
+"""
 商品目录模型
 
 功能：
@@ -30,7 +30,7 @@ class XYCatalogItem(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True, comment="商品ID")
     owner_id: Mapped[int] = mapped_column(BigInteger, index=True, comment="所属用户ID")
-    account_pk: Mapped[int] = mapped_column(
+    account_pk: Mapped[int | None] = mapped_column(
         "account_id",
         BigInteger,
         index=True,

@@ -1,4 +1,4 @@
-﻿"""卡券服务"""
+"""卡券服务"""
 from __future__ import annotations
 
 import json
@@ -104,8 +104,25 @@ class CardService:
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
 
         to_dict = self._card_to_dict_lite if lite else self._card_to_dict_simple
+        items = [to_dict(card) for card in cards]
+
+        # data 型卡券（卡密分类）附带可用库存数：xy_card_secrets 中 status=0 的条数
+        data_card_ids = [card.id for card in cards if card.type == "data"]
+        if data_card_ids:
+            from common.models.card_secret import CardSecret
+
+            stock_rows = await self.session.execute(
+                select(CardSecret.card_id, func.count())
+                .where(CardSecret.card_id.in_(data_card_ids), CardSecret.status == 0)
+                .group_by(CardSecret.card_id)
+            )
+            stock_map = {row[0]: row[1] for row in stock_rows.all()}
+            for card_dict in items:
+                if card_dict.get("type") == "data":
+                    card_dict["stock"] = stock_map.get(card_dict["id"], 0)
+
         return {
-            "list": [to_dict(card) for card in cards],
+            "list": items,
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -327,6 +344,10 @@ class CardService:
     async def consume_batch_data(self, card_id: int) -> Optional[str]:
         """消费批量数据卡券的一条数据
 
+        ⚠ 已废弃：旧 data_content 卡密池已停用，卡密统一走明细表
+        （common/services/card_secret_service.take_one，xy_card_secrets）。
+        本函数仅保留作历史参考，新代码禁止调用。
+
         从卡券的 data_content 中取出第一行数据并删除。
 
         并发安全设计（CAS 乐观锁，不依赖行锁与事务隔离级别）：
@@ -526,6 +547,15 @@ class CardService:
             spec_value=spec_value,
         )
         self.session.add(card)
+        await self.session.flush()  # 获取 card.id
+
+        # data 型卡券：data_content 同步导入卡密明细表（新池唯一货源），
+        # data_content 字段仅作历史快照保留，发货不再读取
+        if card_type == 'data' and data_content:
+            from common.services import card_secret_service
+
+            await card_secret_service.add_batch(self.session, card.id, user_id, data_content)
+
         await self.session.commit()
         await self.session.refresh(card)
         return card.id
@@ -574,6 +604,15 @@ class CardService:
                 elif key == "image_urls" and isinstance(value, list):
                     value = json.dumps(value)
                 setattr(card, key, value)
+
+        # data 型卡券更新 data_content 时：新增行同步追加导入卡密明细表
+        # （按内容去重、只增不删；data_content 字段仅作历史快照，发货只读明细表）
+        if card.type == "data" and kwargs.get("data_content"):
+            from common.services import card_secret_service
+
+            await card_secret_service.add_batch(
+                self.session, card.id, card.user_id, kwargs["data_content"]
+            )
 
         await self.session.commit()
         return True
@@ -663,7 +702,13 @@ class CardService:
         )
         self.session.add(card)
         await self.session.flush()  # 获取 card.id
-        
+
+        # data 型卡券：data_content 同步导入卡密明细表（新池唯一货源）
+        if card_type == 'data' and data_content:
+            from common.services import card_secret_service
+
+            await card_secret_service.add_batch(self.session, card.id, user_id, data_content)
+
         # 2. 通过关联表绑定到多个商品
         matcher = CardMatcher(self.session)
         bind_result = await matcher.batch_bind_cards_to_items(

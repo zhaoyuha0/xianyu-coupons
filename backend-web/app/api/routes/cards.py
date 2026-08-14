@@ -1,17 +1,23 @@
 """卡券管理路由"""
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
+from common.models.card import Card
+from common.models.card_secret import CardSecret
 from common.models.user import User
 from common.schemas.common import ApiResponse
+from common.services import card_secret_service
 from common.utils.auth_scope import resolve_owner_scope
 from common.utils.local_image_upload import ImageUploadError, save_uploaded_image
+from common.utils.time_utils import safe_isoformat
 from app.services.card_service import CardService
 from app.services.selectable_card_service import SelectableCardService
 
@@ -21,6 +27,13 @@ router = APIRouter(tags=["cards"])
 from app.core.paths import STATIC_ROOT
 CARD_UPLOAD_DIR = STATIC_ROOT / "uploads" / "cards"
 CARD_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# 卡密二维码图片上传目录（方案 docs/card-secret-stock-plan.md §3.3）
+CARD_SECRET_UPLOAD_DIR = STATIC_ROOT / "uploads" / "card_secrets"
+CARD_SECRET_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# 卡密图片单批上传数量上限
+CARD_SECRET_BATCH_IMAGE_LIMIT = 50
 
 
 class CardCreate(BaseModel):
@@ -119,6 +132,32 @@ class CardRelationItem(BaseModel):
 class UpdateItemCardsRequest(BaseModel):
     """更新商品关联的卡券列表"""
     card_items: List[CardRelationItem]
+
+
+class SecretBatchRequest(BaseModel):
+    """批量导入文本卡密请求（多行文本，每行一条卡密）"""
+    content: str
+
+
+def _biz_error(code: int, message: str) -> Dict[str, Any]:
+    """统一业务错误响应（HTTP 200，不泄露资源存在性）"""
+    return {"success": False, "code": code, "message": message, "data": None}
+
+
+def _biz_ok(data: Any, message: str = "操作成功") -> Dict[str, Any]:
+    """统一成功响应"""
+    return {"success": True, "code": 200, "message": message, "data": data}
+
+
+async def _get_scoped_card(
+    session: AsyncSession, card_id: int, user_id: Optional[int]
+) -> Optional[Card]:
+    """按 owner_scope 查询卡券；不存在或不属于当前用户返回 None（不泄露存在性）"""
+    stmt = select(Card).where(Card.id == card_id)
+    if user_id is not None:
+        stmt = stmt.where(Card.user_id == user_id)
+    result = await session.execute(stmt)
+    return result.scalars().first()
 
 
 async def get_card_service(session: AsyncSession = Depends(deps.get_db_session)) -> CardService:
@@ -500,11 +539,15 @@ async def update_item_cards(
         {"card_id": item.card_id, "source": item.source, "dock_record_id": item.dock_record_id}
         for item in request.card_items
     ]
-    result = await card_service.update_item_card_relations(
-        item_id=item_id,
-        user_id=current_user.id,
-        card_relations=card_relations,
-    )
+    try:
+        result = await card_service.update_item_card_relations(
+            item_id=item_id,
+            user_id=current_user.id,
+            card_relations=card_relations,
+        )
+    except ValueError as e:
+        # 一商品一分类校验等业务校验失败：统一响应返回业务错误
+        return _biz_error(400, str(e))
     return ApiResponse(
         success=True,
         message=f"已更新关联卡券（新增 {result['added']}，移除 {result['removed']}）",
@@ -527,4 +570,166 @@ async def batch_clear_item_relations(
         success=True,
         message=f"已清空 {len(request.item_ids)} 个商品的卡券关联（共删除 {removed} 条关联记录）",
         data={"removed": removed},
+    )
+
+
+# ==================== 卡密库存端点（方案 docs/card-secret-stock-plan.md §4） ====================
+
+
+@router.get("/{card_id}/stock")
+async def get_card_stock(
+    card_id: int,
+    current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    """查询卡密分类库存（可用/已用/作废数量）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    card = await _get_scoped_card(session, card_id, user_id)
+    if not card:
+        return _biz_error(404, "卡券不存在")
+
+    rows = await session.execute(
+        select(CardSecret.status, func.count())
+        .where(CardSecret.card_id == card_id)
+        .group_by(CardSecret.status)
+    )
+    counts = {status: count for status, count in rows.all()}
+    return _biz_ok({
+        "available": counts.get(0, 0),
+        "used": counts.get(1, 0),
+        "void": counts.get(2, 0),
+    })
+
+
+@router.get("/{card_id}/usage-records")
+async def get_card_usage_records(
+    card_id: int,
+    page: int = Query(default=1, ge=1, description="页码"),
+    page_size: int = Query(default=20, ge=1, le=200, description="每页数量"),
+    current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    """分页查询卡密使用记录（已发卡密及对应订单，按使用时间倒序）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    card = await _get_scoped_card(session, card_id, user_id)
+    if not card:
+        return _biz_error(404, "卡券不存在")
+
+    items, total = await card_secret_service.list_usage_records(
+        session, card.id, user_id=card.user_id, page=page, page_size=page_size
+    )
+    return _biz_ok({
+        "total": total,
+        "items": [
+            {
+                "content": item.content,
+                "order_id": item.order_id,
+                "used_at": safe_isoformat(item.used_at),
+            }
+            for item in items
+        ],
+    })
+
+
+@router.post("/{card_id}/secrets")
+async def add_card_secrets(
+    card_id: int,
+    request: SecretBatchRequest,
+    current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    """批量导入文本卡密（多行文本按行拆分入库，与存量重复的行跳过）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    card = await _get_scoped_card(session, card_id, user_id)
+    if not card:
+        return _biz_error(404, "卡券不存在或无权限操作")
+    if card.type != "data":
+        return _biz_error(400, "仅 data 型卡券（卡密分类）支持导入卡密")
+    if not request.content or not request.content.strip():
+        return _biz_error(400, "卡密内容不能为空")
+
+    added = await card_secret_service.add_batch(
+        session, card.id, card.user_id, request.content
+    )
+    if added == 0:
+        return _biz_error(400, "没有可导入的有效卡密（可能全部为空行或与存量重复）")
+    await session.commit()
+    return _biz_ok({"added": added}, message=f"成功导入 {added} 条卡密")
+
+
+@router.post("/{card_id}/secrets/batch-images")
+async def add_card_secret_images(
+    card_id: int,
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    """批量导入二维码图片卡密（方案 §3.3）
+
+    - 单批最多 50 张，单张 ≤ 5MB，content_type 必须 image/*
+    - 逐张落盘到 static/uploads/card_secrets/，按图片字节 MD5 去重（重复不落盘）
+    - 某张校验失败时整体回滚（已落盘文件删除）并返回中文错误原因
+    """
+    user_id, _ = resolve_owner_scope(current_user)
+    card = await _get_scoped_card(session, card_id, user_id)
+    if not card:
+        return _biz_error(404, "卡券不存在或无权限操作")
+    if card.type != "data":
+        return _biz_error(400, "仅 data 型卡券（卡密分类）支持导入卡密图片")
+    if not files:
+        return _biz_error(400, "请至少上传一张图片")
+    if len(files) > CARD_SECRET_BATCH_IMAGE_LIMIT:
+        return _biz_error(400, f"单批最多上传 {CARD_SECRET_BATCH_IMAGE_LIMIT} 张图片")
+
+    # 逐张校验并落盘（复用 save_uploaded_image 的类型/大小/扩展名安全校验）
+    saved: list[tuple[Any, str, str]] = []  # (filepath, 相对URL, MD5)
+    try:
+        for image in files:
+            filepath, filename, content = await save_uploaded_image(
+                image,
+                CARD_SECRET_UPLOAD_DIR,
+                filename_prefix=f"card_{card_id}",
+            )
+            image_md5 = hashlib.md5(content).hexdigest()
+            saved.append((filepath, f"/static/uploads/card_secrets/{filename}", image_md5))
+    except ImageUploadError as exc:
+        # 整体回滚：删除本批已落盘文件
+        for filepath, _, _ in saved:
+            try:
+                filepath.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return _biz_error(exc.status_code, exc.message)
+
+    # 按图片字节 MD5 去重：与存量或批次内重复的图片删除落盘文件并计入 skipped
+    existing = (
+        await session.execute(
+            select(CardSecret.image_hash).where(
+                CardSecret.card_id == card.id,
+                CardSecret.image_hash.isnot(None),
+            )
+        )
+    ).scalars().all()
+    seen = set(existing)
+
+    images: list[tuple[str, str]] = []
+    skipped = 0
+    for filepath, url, image_md5 in saved:
+        if image_md5 in seen:
+            try:
+                filepath.unlink(missing_ok=True)
+            except Exception:
+                pass
+            skipped += 1
+            continue
+        seen.add(image_md5)
+        images.append((url, image_md5))
+
+    result = await card_secret_service.add_batch_images(
+        session, card.id, card.user_id, images
+    )
+    await session.commit()
+    return _biz_ok(
+        {"added": result["added"], "skipped": skipped + result["skipped"]},
+        message=f"成功导入 {result['added']} 张卡密图片",
     )

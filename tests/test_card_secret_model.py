@@ -29,6 +29,16 @@ class TestCardSecretModel:
         assert row.order_id is None, "新卡密 order_id 应为空"
         assert row.used_at is None, "新卡密 used_at 应为空"
 
+    async def test_卡密形态字段默认值(self, async_session):
+        """验证 content_type 默认 0（文本卡密）、image_hash 默认为空（方案 §2）。"""
+        row = CardSecret(card_id=1, user_id=1, content="CARD-001")
+        async_session.add(row)
+        await async_session.commit()
+        await async_session.refresh(row)
+
+        assert row.content_type == 0, "新卡密默认应为文本类型（content_type=0）"
+        assert row.image_hash is None, "文本卡密 image_hash 应为空"
+
     async def test_必填字段校验(self, async_session):
         """验证 card_id、user_id、content 缺失时落库报错（NOT NULL 约束）。"""
         # 缺 card_id
@@ -88,4 +98,16 @@ class TestCardSecretIndex:
         columns = [col.name for col in target.columns]
         assert columns == ["card_id", "status"], (
             f"索引列应为 (card_id, status)，实际 {columns}"
+        )
+
+    async def test_按分类加图片哈希的复合索引存在(self):
+        """验证 idx_card_hash(card_id, image_hash) 存在，保证图片导入去重走索引（方案 §2）。"""
+        from sqlalchemy import Index
+
+        indexes = [arg for arg in CardSecret.__table_args__ if isinstance(arg, Index)]
+        target = next((idx for idx in indexes if idx.name == "idx_card_hash"), None)
+        assert target is not None, "应定义 idx_card_hash 复合索引"
+        columns = [col.name for col in target.columns]
+        assert columns == ["card_id", "image_hash"], (
+            f"索引列应为 (card_id, image_hash)，实际 {columns}"
         )

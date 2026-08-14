@@ -290,15 +290,24 @@ class CardMatcher:
     ) -> Dict[str, int]:
         """
         更新商品关联的卡券列表（先删旧关联再插新关联）
-        
+
+        绑定约束（卡密库存方案 §2）：同一商品同一规格只能绑一张自有（source=own）
+        data 型卡券（卡密分类）；多规格商品每规格可各绑一种；非 data 型卡券与
+        分销卡券（dock_l1/l2）不受本约束。校验在删插之前完成，失败整体不落库。
+
         Args:
             item_id: 商品ID
             user_id: 用户ID
             card_relations: 卡券关联列表，每个元素含 card_id, source, dock_record_id
-            
+
         Returns:
             {"added": 新增数量, "removed": 删除数量}
+
+        Raises:
+            ValueError: 同一商品同一规格绑定了多张自有 data 型卡券时抛出
         """
+        await self._validate_one_data_card_per_spec(card_relations or [])
+
         # 删除旧关联
         delete_result = await self.session.execute(
             text("DELETE FROM xy_card_item_relations WHERE item_id = :item_id"),
@@ -452,6 +461,43 @@ class CardMatcher:
         return removed
 
     # ==================== 内部方法 ====================
+
+    async def _validate_one_data_card_per_spec(
+        self,
+        card_relations: List[Dict[str, Any]],
+    ) -> None:
+        """校验"一商品一分类"：同一商品同一规格只能绑一张自有 data 型卡券
+
+        规则：
+        - 仅约束自有（source=own）且 type=data 的卡券（卡密分类）
+        - 多规格卡券按 (spec_name, spec_value) 隔离，不同规格可各绑一张
+        - 非 data 型卡券、分销卡券（dock_l1/l2）不参与约束
+
+        Raises:
+            ValueError: 同一规格绑定了多张自有 data 型卡券时抛出
+        """
+        card_ids = [rel.get("card_id") for rel in card_relations if rel.get("card_id")]
+        if not card_ids:
+            return
+
+        result = await self.session.execute(select(Card).where(Card.id.in_(card_ids)))
+        cards_by_id = {card.id: card for card in result.scalars().all()}
+
+        bound_specs: dict[Any, str] = {}
+        for rel in card_relations:
+            if (rel.get("source") or "own") != "own":
+                continue
+            card = cards_by_id.get(rel.get("card_id"))
+            if not card or card.type != "data":
+                continue
+            # 多规格按规格值隔离；非多规格统一归为 None（同一商品只能绑一张）
+            spec_key = (card.spec_name, card.spec_value) if card.is_multi_spec else None
+            if spec_key in bound_specs:
+                raise ValueError(
+                    f"同一商品同一规格只能绑定一个卡密分类（data 型卡券）："
+                    f"「{bound_specs[spec_key]}」与「{card.name}」冲突，请只保留一个"
+                )
+            bound_specs[spec_key] = card.name
 
     async def _query_cards_with_source(self, item_id: str) -> List[tuple]:
         """

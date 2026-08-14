@@ -39,6 +39,7 @@ export interface CardData {
   item_ids?: string[]  // 关联的商品ID列表（多对多）
   card_source?: 'own' | 'dock_l1' | 'dock_l2'  // 关联来源（从关联表返回）
   dock_record_id?: number | null  // 对接记录ID（从关联表返回）
+  stock?: number  // data 型卡券（卡密分类）的可用库存数（xy_card_secrets 中 status=0 条数）
 }
 
 // 卡券分页查询参数
@@ -97,6 +98,7 @@ export interface SelectableCard {
   enabled?: boolean
   price?: string | null
   unique_key: string
+  stock?: number  // 自有 data 型卡券（卡密分类）的可用库存数
 }
 
 // 可选卡券分页响应
@@ -198,4 +200,55 @@ export const updateItemCards = (
 // 批量清空商品的卡券关联关系（不删除卡券本身）
 export const batchClearItemRelations = (itemIds: string[]): Promise<ApiResponse> => {
   return post(`${CARD_PREFIX}/batch-clear-item-relations`, { item_ids: itemIds })
+}
+
+// ==================== 卡密库存（方案 docs/card-secret-stock-plan.md §4） ====================
+
+// 卡密分类库存统计
+export interface CardStockInfo {
+  available: number  // 可用（status=0）
+  used: number       // 已用（status=1）
+  void: number       // 作废（status=2）
+}
+
+// 卡密使用记录
+export interface CardSecretUsageRecord {
+  content: string    // 文本卡密原文；图片卡密为图片相对URL
+  order_id: string   // 消费该卡密的订单号
+  used_at: string    // 使用时间
+}
+
+// 查询卡密分类库存（可用/已用/作废）
+export const getCardStock = (cardId: number): Promise<ApiResponse<CardStockInfo>> => {
+  return get(`${CARD_PREFIX}/${cardId}/stock`)
+}
+
+// 分页查询卡密使用记录（按使用时间倒序）
+export const getCardUsageRecords = (
+  cardId: number,
+  page: number = 1,
+  pageSize: number = 20,
+): Promise<ApiResponse<{ total: number; items: CardSecretUsageRecord[] }>> => {
+  const q = new URLSearchParams()
+  q.set('page', String(page))
+  q.set('page_size', String(pageSize))
+  return get(`${CARD_PREFIX}/${cardId}/usage-records?${q.toString()}`)
+}
+
+// 批量导入文本卡密（多行文本按行拆分入库，重复行跳过）
+export const addCardSecrets = (
+  cardId: number,
+  content: string,
+): Promise<ApiResponse<{ added: number }>> => {
+  return post(`${CARD_PREFIX}/${cardId}/secrets`, { content })
+}
+
+// 批量导入二维码图片卡密（multipart 多文件，按图片字节 MD5 去重）
+export const uploadCardSecretImages = (
+  cardId: number,
+  files: File[],
+): Promise<ApiResponse<{ added: number; skipped: number }>> => {
+  const formData = new FormData()
+  files.forEach(file => formData.append('files', file))
+  return post(`${CARD_PREFIX}/${cardId}/secrets/batch-images`, formData)
 }

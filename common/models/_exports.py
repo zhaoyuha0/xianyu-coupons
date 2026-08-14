@@ -10,6 +10,7 @@ from common.models.xy_catalog_item import XYCatalogItem
 from common.models.xy_keyword_rule import XYKeywordRule
 from common.models.xy_order import XYOrder
 from common.models.card import Card
+from common.models.card_secret import CardSecret
 from common.models.default_reply import DefaultReply, DefaultReplyRecord
 from common.models.ai_chat_message import AIChatMessage
 from common.models.risk_control_log import XYRiskControlLog as RiskControlLog
@@ -73,6 +74,7 @@ __all__ = [
     "XYKeywordRule",
     "XYOrder",
     "Card",
+    "CardSecret",
     "DefaultReply",
     "DefaultReplyRecord",
     "AIChatMessage",

@@ -40,6 +40,9 @@ _API_DEFAULT_TIMEOUT = 10
 async def consume_batch_data(session: AsyncSession, card_id: int) -> Optional[str]:
     """消费批量数据卡券的一条数据（行锁，防止并发重复派发）
 
+    ⚠ 已废弃：旧 data_content 卡密池已停用，卡密统一走明细表
+    （card_secret_service.take_one，xy_card_secrets）。本函数仅保留作历史参考。
+
     从卡券 data_content 中取出第一行并删除，使用 SELECT ... FOR UPDATE 行锁，
     保证同一张卡券在并发消费时被串行化。调用方需保证在同一事务内执行，
     行锁在事务提交或回滚时释放。
@@ -199,7 +202,7 @@ async def build_delivery_content(
 
     各类型处理：
     - text：固定文字
-    - data：消费一条批量数据（行锁）
+    - data：从卡密明细表原子取一条卡密（文本卡密返回原文，图片卡密返回图片URL）
     - api：调用外部接口拉取
     - image：返回图片URL（提货为纯文本，约定将图片URL作为文本返回）
 
@@ -221,10 +224,18 @@ async def build_delivery_content(
     if card_type == 'text':
         text_content = card.text_content
     elif card_type == 'data':
-        text_content = await consume_batch_data(session, card.id)
-        if text_content is None:
-            logger.warning(f"卡券 {card.id} 批量数据已用完，提货失败")
+        # data 型卡券走卡密明细表（xy_card_secrets）原子取密：
+        # 文本卡密返回原文；二维码图片卡密（content_type=1）把图片URL作为文本返回
+        # （提货为纯文本场景，与 image 型卡券提货行为一致）；库存空返回 None。
+        from common.services import card_secret_service
+
+        secret = await card_secret_service.take_one(
+            session, card.id, context.get('order_id', '')
+        )
+        if secret is None:
+            logger.warning(f"卡券 {card.id} 卡密库存已空，提货失败")
             return None
+        text_content = secret.content
     elif card_type == 'api':
         text_content = await get_api_card_content(card.api_config, context)
         if text_content is None:

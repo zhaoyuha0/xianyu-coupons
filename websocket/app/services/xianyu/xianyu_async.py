@@ -1170,6 +1170,7 @@ class XianyuAsync:
                 '[买家已付款]',
                 '[付款完成]',
                 '[已付款，待发货]',
+                '[我已付款，请添加自提信息]',  # 自提商品的付款触发卡片
             ]
             
             if send_message not in fetch_detail_messages:

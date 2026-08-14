@@ -11,7 +11,7 @@
 import { useState, useEffect } from 'react'
 import {
   Ticket, RefreshCw, Trash2, Search, Power, PowerOff, Image,
-  ChevronLeft, ChevronRight, CheckSquare, Square, Edit2, Copy, Eye, Plus, Link
+  ChevronLeft, ChevronRight, CheckSquare, Square, Edit2, Copy, Eye, Plus, Link, Layers
 } from 'lucide-react'
 import { getCards, updateCard, deleteCard, batchDeleteCards, type CardData, type CardPaginatedResult } from '@/api/cards'
 import { useUIStore } from '@/store/uiStore'
@@ -21,6 +21,7 @@ import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { CardDetailModal } from './CardDetailModal'
 import { CardFormModal, cardToFormData, cardToCopyFormData, emptyCardFormData } from './CardFormModal'
 import { CardItemRelationModal } from './CardItemRelationModal'
+import { CardSecretStockModal } from './CardSecretStockModal'
 
 // 卡券类型标签（与发货配置一致）
 const cardTypeLabels: Record<string, string> = {
@@ -66,6 +67,9 @@ export function Cards() {
   // 关联商品弹窗
   const [relationCard, setRelationCard] = useState<CardData | null>(null)
   const [relationReadonly, setRelationReadonly] = useState(false)
+
+  // 卡密库存管理弹窗（仅 data 型卡券）
+  const [secretCard, setSecretCard] = useState<CardData | null>(null)
 
   // 分页状态
   const [page, setPage] = useState(1)
@@ -409,10 +413,23 @@ export function Cards() {
                           ) : (
                             <span className="text-gray-400 text-sm">暂无图片</span>
                           )
+                        ) : card.type === 'data' ? (
+                          /* data 型卡券（卡密分类）：显示卡密明细库存，库存空红色警示，点击打开卡密管理 */
+                          <button
+                            onClick={() => setSecretCard(card)}
+                            title="卡密库存管理"
+                            className={`px-2 py-1 text-xs font-medium rounded transition-colors inline-flex items-center gap-1 ${
+                              (card.stock ?? 0) === 0
+                                ? 'bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400'
+                                : 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
+                            }`}
+                          >
+                            <Layers className="w-3 h-3" />
+                            库存 {card.stock ?? 0} 条
+                          </button>
                         ) : (
                           <code className="text-xs bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded truncate block max-w-[220px]">
                             {card.type === 'text' && (card.text_content || '-')}
-                            {card.type === 'data' && (card.data_content ? `剩余 ${card.data_content.split('\n').filter((line: string) => line.trim()).length} 条` : '-')}
                             {card.type === 'api' && (card.api_config?.url || '-')}
                             {!['text', 'data', 'api', 'image'].includes(card.type) && '-'}
                           </code>
@@ -487,6 +504,15 @@ export function Cards() {
                           >
                             <Eye className="w-4 h-4 text-blue-500" />
                           </button>
+                          {card.type === 'data' && (
+                            <button
+                              onClick={() => setSecretCard(card)}
+                              className="table-action-btn hover:!bg-amber-50"
+                              title="卡密库存管理"
+                            >
+                              <Layers className="w-4 h-4 text-amber-500" />
+                            </button>
+                          )}
                           <button
                             onClick={() => openEditModal(card)}
                             className="table-action-btn hover:!bg-blue-50"
@@ -581,6 +607,8 @@ export function Cards() {
         <CardItemRelationModal
           cardId={relationCard.id!}
           cardName={relationCard.name}
+          cardType={relationCard.type}
+          cardStock={relationCard.stock}
           onClose={() => { setRelationCard(null); setRelationReadonly(false) }}
           onSaved={loadCards}
           readonly={relationReadonly}
@@ -590,6 +618,15 @@ export function Cards() {
       {/* 查看明细弹窗 */}
       {detailCard && (
         <CardDetailModal card={detailCard} onClose={() => setDetailCard(null)} />
+      )}
+
+      {/* 卡密库存管理弹窗（data 型卡券） */}
+      {secretCard && (
+        <CardSecretStockModal
+          card={secretCard}
+          onClose={() => setSecretCard(null)}
+          onChanged={loadCards}
+        />
       )}
 
       {/* 编辑/复制弹窗 */}

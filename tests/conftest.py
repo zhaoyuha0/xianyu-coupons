@@ -220,6 +220,12 @@ def mock_im_sender():
 
 
 @pytest.fixture
+def mock_image_sender():
+    """Mock 闲鱼图片消息发送（send_image_msg），用于图片卡密发货路径断言。"""
+    return AsyncMock()
+
+
+@pytest.fixture
 def mock_task_queue():
     """Mock Redis 上下架任务队列（enqueue_stock_task），断言投递的 action 与载荷。"""
     return AsyncMock()

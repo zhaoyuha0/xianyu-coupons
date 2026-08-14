@@ -1661,24 +1661,35 @@ async def deliver_order(request: DeliverOrderRequest):
         for i in range(quantity):
             # ---- 1. 获取本张卡密的原始内容 ----
             content = None
+            content_is_image = card.type == 'image'  # 图片卡密（二维码）也走图片消息通道
             if card.type == 'text':
                 content = card.text_content
             elif card.type == 'data':
-                content = db_manager.consume_batch_data(request.card_id)
-                if not content:
+                # 卡密统一走明细表（xy_card_secrets 新池），旧 data_content 池已废弃：
+                # 取出即置为已用并记录订单号（即使发送失败也可在订单/使用记录中追溯）
+                from common.db.session import async_session_maker
+                from common.services import card_secret_service
+                async with async_session_maker() as secret_session:
+                    secret = await card_secret_service.take_one(
+                        secret_session, request.card_id, request.order_no or ''
+                    )
+                    await secret_session.commit()
+                if not secret:
                     if not raw_contents:
-                        logger.error(f"【内部API】批量数据已用完: card_id={request.card_id}")
+                        logger.error(f"【内部API】卡密库存已用完: card_id={request.card_id}")
                         return {
                             "success": False,
                             "code": 400,
-                            "message": "批量数据已用完",
+                            "message": "卡密库存已用完",
                             "data": None
                         }
                     early_break_reason = (
-                        f"批量数据库存不足：第 {i+1}/{quantity} 张消费时已用完"
+                        f"卡密库存不足：第 {i+1}/{quantity} 张消费时已用完"
                     )
                     logger.warning(f"【内部API】{early_break_reason}")
                     break
+                content = secret.content
+                content_is_image = secret.content_type == 1
             elif card.type == 'image':
                 content = card.image_url
             elif card.type == 'api':
@@ -1722,7 +1733,7 @@ async def deliver_order(request: DeliverOrderRequest):
             # ---- 2. 立刻发送本张内容（成功/失败都记录到 final_contents） ----
             send_ok = False
             try:
-                if card.type == 'image':
+                if content_is_image:
                     logger.info(
                         f"【内部API】发送图片消息 第 {idx}/{quantity}: {content}"
                         if quantity > 1 else f"【内部API】发送图片消息: {content}"
@@ -1760,7 +1771,7 @@ async def deliver_order(request: DeliverOrderRequest):
                 # 都能在订单 delivery_content 中追溯，避免数据丢失。商家可从这里手动复制转发。
                 failed_indices.append(idx)
                 logger.error(f"【内部API】第 {idx}/{quantity} 张卡券发送异常: {send_err}")
-                if card.type == 'image':
+                if content_is_image:
                     final_contents.append(f"[图片-发送失败-请手动转发]{content}")
                 else:
                     # 失败的内容仍按原始 content 记录（不渲染备注，保留原始可复用形态）

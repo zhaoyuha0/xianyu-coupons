@@ -118,6 +118,26 @@ class SelectableCardService:
 
     # ---------- 行 → 统一项 ----------
 
+    async def _attach_stock(self, items: List[Dict[str, Any]]) -> None:
+        """为自有 data 型卡券（卡密分类）附带可用库存数（xy_card_secrets 中 status=0 条数）"""
+        data_card_ids = [
+            item["id"] for item in items
+            if item.get("source") == "own" and item.get("type") == "data" and item.get("id")
+        ]
+        if not data_card_ids:
+            return
+        from common.models.card_secret import CardSecret
+
+        stock_rows = await self.session.execute(
+            select(CardSecret.card_id, func.count())
+            .where(CardSecret.card_id.in_(data_card_ids), CardSecret.status == 0)
+            .group_by(CardSecret.card_id)
+        )
+        stock_map = {row[0]: row[1] for row in stock_rows.all()}
+        for item in items:
+            if item.get("source") == "own" and item.get("type") == "data":
+                item["stock"] = stock_map.get(item["id"], 0)
+
     def _own_card_to_item(self, card: Card) -> Dict[str, Any]:
         """自有卡券 → 选择项字典"""
         return {
@@ -222,6 +242,8 @@ class SelectableCardService:
             )).all()
             items.extend(self._dock_row_to_item(r) for r in dock_rows)
 
+        await self._attach_stock(items)
+
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
         return {
             "list": items,
@@ -255,4 +277,5 @@ class SelectableCardService:
             self._dock_data_stmt(dock_conds, 0, None)
         )).all()
         items.extend(self._dock_row_to_item(r) for r in dock_rows)
+        await self._attach_stock(items)
         return items

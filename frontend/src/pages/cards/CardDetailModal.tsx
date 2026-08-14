@@ -78,9 +78,12 @@ export function CardDetailModal({ card, onClose, zIndex = 60 }: CardDetailModalP
             <DetailRow label="文本内容" value={card.text_content || '-'} multiline />
           )}
 
-          {/* 批量数据 */}
+          {/* 批量数据（卡密分类） */}
           {card.type === 'data' && (
             <div>
+              {card.stock !== undefined && (
+                <DetailRow label="卡密库存" value={`可用 ${card.stock} 条（明细表）`} />
+              )}
               <DetailRow
                 label="批量数据"
                 value={card.data_content || '-'}

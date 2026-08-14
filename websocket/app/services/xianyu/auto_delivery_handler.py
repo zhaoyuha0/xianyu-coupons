@@ -33,6 +33,140 @@ from common.utils.response_field import extract_card_api_response_content
 SEND_BEFORE_CONFIRM_WAIT_TIMEOUT = float(os.getenv('SEND_BEFORE_CONFIRM_WAIT_TIMEOUT', '8'))
 
 
+# ==================== 卡密库存发货钩子（方案 docs/card-secret-stock-plan.md §3.2） ====================
+
+# Redis 上下架任务队列名（scheduler 的 stock_task_worker 消费）
+STOCK_TASKS_QUEUE = "stock_tasks"
+
+
+def is_local_data_card(card_dict) -> bool:
+    """判定卡券是否走本地卡密库存（xy_card_secrets）
+
+    仅自有（card_source=own）且 type=data 的卡券走本地卡密库存；
+    分销卡券（dock_l1/l2）不走本地库存；未匹配到卡券（None）返回 False。
+    """
+    if not card_dict:
+        return False
+    return (
+        card_dict.get('type') == 'data'
+        and (card_dict.get('card_source') or 'own') == 'own'
+    )
+
+
+async def enqueue_stock_task(payload: dict) -> None:
+    """把上下架任务投递到 Redis 队列（stock_tasks），由 scheduler 的 worker 消费
+
+    载荷约定：{"action": "relist"|"offline", "item_id", "card_id", "account_id", "retry": 0}
+    """
+    from common.db.redis_client import get_redis_client
+
+    client = await get_redis_client()
+    await client.rpush(STOCK_TASKS_QUEUE, json.dumps(payload, ensure_ascii=False))
+    logger.info(f"已投递库存任务: {payload}")
+
+
+async def notify_seller_stock_empty(message: str) -> None:
+    """库存空卖家告警（默认实现：记录日志；通知渠道接入后在此扩展）"""
+    logger.warning(f"【卡密库存告警】{message}")
+
+
+async def deliver_data_card_secret(
+    session,
+    *,
+    card,
+    item_id: str,
+    order_id: str,
+    buyer_id: str,
+    account_id: str,
+    send_message,
+    send_image=None,
+    enqueue_task=None,
+    notify=None,
+    confirm_delivery=None,
+) -> bool:
+    """卡密发货钩子：取密 → 发送 → 上下架任务投递（先取密占位，发货成功才算数）
+
+    流程：
+    1. card_secret_service.take_one 原子取一条可用卡密；库存空则投递下架任务并返回 False
+    2. confirm_delivery（可选）确认发货回调，失败回滚卡密
+    3. 按 content_type 分发：文本卡密走 send_message，二维码图片卡密走 send_image
+       （未提供 send_image 时退化为把图片URL作为文本发送）；发送异常 release 回滚卡密
+    4. 发货成功：剩余库存 >0 投递 relist 任务（售出重上架），=0 投递 offline 任务并告警卖家
+
+    Args:
+        session: 数据库会话（调用方负责事务边界）
+        card: xy_cards ORM 对象（data 型卡券）
+        item_id: 商品ID
+        order_id: 订单号
+        buyer_id: 买家ID
+        account_id: 闲鱼账号ID（任务载荷用）
+        send_message: async (buyer_id, content) IM 文本发送
+        send_image: 可选 async (buyer_id, image_url) 图片消息发送
+        enqueue_task: async (payload: dict) Redis 任务投递
+        notify: async (message: str) 卖家通知
+        confirm_delivery: 可选 async () 确认发货回调，失败同样回滚卡密
+
+    Returns:
+        True=已发货；False=库存空未发货
+    """
+    from common.services import card_secret_service
+
+    enqueue_task = enqueue_task or enqueue_stock_task
+    notify = notify or notify_seller_stock_empty
+
+    def _task_payload(action: str) -> dict:
+        return {
+            "action": action,
+            "item_id": item_id,
+            "card_id": card.id,
+            "account_id": account_id,
+            "retry": 0,
+        }
+
+    async def _safe_enqueue(action: str) -> None:
+        """任务投递失败只告警不向外抛（不影响已完成的发货）"""
+        try:
+            await enqueue_task(_task_payload(action))
+        except Exception as e:
+            logger.error(f"投递库存任务失败（action={action}, item_id={item_id}）: {e}")
+
+    # 1. 原子取密占位
+    secret = await card_secret_service.take_one(session, card.id, order_id)
+    if secret is None:
+        logger.warning(f"卡密分类 {card.id}（{card.name}）库存已空，商品 {item_id} 触发下架")
+        await _safe_enqueue("offline")
+        return False
+
+    try:
+        # 2. 可选确认发货回调（前置校验，失败回滚卡密）
+        if confirm_delivery is not None:
+            await confirm_delivery()
+
+        # 3. 按卡密形态分发发送通道
+        if secret.content_type == 1 and send_image is not None:
+            await send_image(buyer_id, secret.content)
+        else:
+            # 文本卡密走文本消息；图片卡密未提供图片通道时退化为发送图片URL文本
+            await send_message(buyer_id, secret.content)
+    except Exception:
+        # IM 发送/确认失败必须 release 回滚，避免发失败还扣库存
+        await card_secret_service.release(session, secret.id)
+        raise
+
+    # 4. 发货成功后的上下架分支
+    remaining = await card_secret_service.stock_of(session, card.id)
+    if remaining > 0:
+        await _safe_enqueue("relist")
+    else:
+        await _safe_enqueue("offline")
+        try:
+            await notify(f"卡密分类【{card.name}】库存已空，商品已下架，请及时补货")
+        except Exception as e:
+            logger.error(f"库存空卖家告警发送失败（卡密分类 {card.id}）: {e}")
+
+    return True
+
+
 class AutoDeliveryHandler:
     """自动发货处理器"""
     
@@ -2016,6 +2150,7 @@ class AutoDeliveryHandler:
 
                 delivery_content = None
                 text_content = None  # 文字内容
+                secret_image_url = None  # 图片卡密（二维码）URL，优先走图片发送协议
 
                 # 根据卡券类型处理发货内容
                 if rule['card_type'] == 'api':
@@ -2039,12 +2174,74 @@ class AutoDeliveryHandler:
                     text_content = rule.get('card_text_content')
 
                 elif rule['card_type'] == 'data':
-                    # 批量数据类型：获取并消费第一条数据
-                    text_content = db_manager.consume_batch_data(rule['card_id'])
-                    if text_content is None:
-                        self._last_delivery_fail_reason = f"批量卡券数据已用完或获取失败: 卡券ID={rule['card_id']}, 名称={rule['card_name']}"
-                        logger.warning(self._last_delivery_fail_reason)
-                        return None
+                    if is_local_data_card(card):
+                        # 自有 data 卡券走本地卡密库存（xy_card_secrets 明细表）：
+                        # deliver_data_card_secret 负责原子取密、库存空下架、售出重上架钩子；
+                        # 此处的 send_message/send_image 只做内容捕获，实际 IM 发送沿用
+                        # 下方统一发送链路（含 ###### 分隔、图片协议、消息日志等既有能力）。
+                        secret_capture: dict = {}
+
+                        async def _capture_secret_text(buyer_id, content):
+                            secret_capture['kind'] = 'text'
+                            secret_capture['content'] = content
+
+                        async def _capture_secret_image(buyer_id, image_url):
+                            secret_capture['kind'] = 'image'
+                            secret_capture['content'] = image_url
+
+                        from common.db.session import async_session_maker
+                        from common.models.card import Card as _CardModel
+
+                        async with async_session_maker() as secret_session:
+                            card_obj = await secret_session.get(_CardModel, rule['card_id'])
+                            delivered = await deliver_data_card_secret(
+                                secret_session,
+                                card=card_obj,
+                                item_id=item_id,
+                                order_id=order_id,
+                                buyer_id=send_user_id,
+                                account_id=self.cookie_id,
+                                send_message=_capture_secret_text,
+                                send_image=_capture_secret_image,
+                                enqueue_task=enqueue_stock_task,
+                                notify=notify_seller_stock_empty,
+                            )
+                            await secret_session.commit()
+
+                        if not delivered:
+                            self._last_delivery_fail_reason = (
+                                f"卡密分类库存已空，商品 {item_id} 已触发下架: "
+                                f"卡券ID={rule['card_id']}, 名称={rule['card_name']}"
+                            )
+                            logger.warning(self._last_delivery_fail_reason)
+                            return None
+
+                        if secret_capture.get('kind') == 'image':
+                            secret_image_url = secret_capture.get('content')
+                            text_content = None
+                        else:
+                            text_content = secret_capture.get('content')
+                    else:
+                        # 分销/未绑定来源的 data 卡券：同样走卡密明细表（旧 data_content 池已废弃，
+                        # 卡密物理上属于货主卡券，取密即扣新池并记录订单号）；
+                        # 但不触发本地库存上下架钩子（分销商品的库存与上下架由货主自己管理）
+                        from common.db.session import async_session_maker as _session_maker
+                        from common.services import card_secret_service as _secret_service
+
+                        async with _session_maker() as _secret_session:
+                            _secret = await _secret_service.take_one(
+                                _secret_session, rule['card_id'], order_id or ''
+                            )
+                            await _secret_session.commit()
+                        if _secret is None:
+                            self._last_delivery_fail_reason = f"卡密库存已用完: 卡券ID={rule['card_id']}, 名称={rule['card_name']}"
+                            logger.warning(self._last_delivery_fail_reason)
+                            return None
+                        if _secret.content_type == 1:
+                            secret_image_url = _secret.content
+                            text_content = None
+                        else:
+                            text_content = _secret.content
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：文字内容为空，只发送图片
@@ -2053,6 +2250,11 @@ class AutoDeliveryHandler:
                 # 检查是否有图片需要发送（所有卡券类型都可以配置图片）
                 image_urls = rule.get('card_image_urls') or []
                 single_image_url = rule.get('card_image_url')
+
+                # 图片卡密（二维码）：取到的卡密图片优先于卡券配置图片，走单图片发送协议
+                if secret_image_url:
+                    image_urls = []
+                    single_image_url = secret_image_url
                 card_description = rule.get('card_description', '')
 
                 # 构建订单上下文变量（用于备注中的变量替换）

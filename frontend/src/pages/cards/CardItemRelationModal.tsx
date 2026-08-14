@@ -48,6 +48,10 @@ interface CardItemRelationModalProps {
   cardId: number
   /** 卡券名称（用于弹窗标题） */
   cardName: string
+  /** 卡券类型（data 型卡密分类时在标题旁显示库存） */
+  cardType?: string
+  /** 可用库存数（仅 data 型卡券展示） */
+  cardStock?: number
   /** 关闭回调 */
   onClose: () => void
   /** 保存成功回调 */
@@ -56,7 +60,7 @@ interface CardItemRelationModalProps {
   readonly?: boolean
 }
 
-export function CardItemRelationModal({ cardId, cardName, onClose, onSaved, readonly = false }: CardItemRelationModalProps) {
+export function CardItemRelationModal({ cardId, cardName, cardType, cardStock, onClose, onSaved, readonly = false }: CardItemRelationModalProps) {
   const { addToast } = useUIStore()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -253,8 +257,17 @@ export function CardItemRelationModal({ cardId, cardName, onClose, onSaved, read
     <div className="modal-overlay" style={{ zIndex: 60 }}>
       <div className="modal-content max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
         <div className="modal-header flex items-center justify-between flex-shrink-0">
-          <h2 className="text-lg font-semibold">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
             {readonly ? '查看关联商品' : '关联商品'} - {cardName}
+            {cardType === 'data' && (
+              <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                (cardStock ?? 0) === 0
+                  ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                  : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+              }`}>
+                库存 {cardStock ?? 0} 条
+              </span>
+            )}
           </h2>
           <button onClick={onClose} className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg">
             <X className="w-4 h-4 text-gray-500" />

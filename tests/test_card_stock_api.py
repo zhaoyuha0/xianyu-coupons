@@ -8,6 +8,8 @@
 - GET  /cards                           → data 型卡券列表项附带 "stock" 字段
 - GET  /cards/{card_id}/usage-records   → data {"total","items":[{content,order_id,used_at}]}（分页）
 - POST /cards/{card_id}/secrets         → body {"content": 多行文本}，data {"added": n}
+- POST /cards/{card_id}/secrets/batch-images → multipart 多文件字段 files，
+  data {"added": n, "skipped": m}（方案 §3.3，批量导入二维码图片卡密）
 - PUT  /cards/item/{item_id}/cards      → 绑定校验（一商品一分类），已有端点待加校验
 
 测试方式：独立 FastAPI 实例挂载 cards 路由，dependency_overrides 覆写
@@ -237,3 +239,147 @@ class TestBindingValidationApi:
         assert relation.card_id == card.id
         assert relation.source == "own"
         assert relation.dock_record_id == 0
+
+
+def _png(tag: bytes) -> bytes:
+    """构造带唯一标识的最小 PNG 字节串（不同 tag 产生不同 MD5）。"""
+    return b"\x89PNG\r\n\x1a\n" + tag
+
+
+def _files(*tags: bytes) -> list:
+    """把若干 tag 转成 httpx multipart 的 files 参数（字段名 files）。"""
+    return [
+        ("files", (f"qr_{tag.decode()}.png", _png(tag), "image/png"))
+        for tag in tags
+    ]
+
+
+class TestBatchImagesApi:
+    """批量导入卡密图片端点（方案 §3.3）。
+
+    契约：POST /cards/{card_id}/secrets/batch-images，multipart 字段 files。
+    """
+
+    async def test_批量上传二维码图片成功(self, api, seed_card, async_session):
+        """验证多张图片一次上传后逐张落库为可用图片卡密，返回 added/skipped。"""
+        card = await seed_card()
+
+        resp = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images",
+            files=_files(b"a1", b"a2", b"a3"),
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"] == {"added": 3, "skipped": 0}, "3 张全新图片应全部导入"
+
+        from sqlalchemy import select
+
+        from common.models.card_secret import CardSecret
+
+        rows = (await async_session.execute(
+            select(CardSecret).where(CardSecret.card_id == card.id)
+        )).scalars().all()
+        assert len(rows) == 3
+        for row in rows:
+            assert row.content_type == 1, "导入的卡密应为图片类型"
+            assert row.status == 0, "导入的卡密应为可用状态"
+            assert row.content.startswith("/static/uploads/card_secrets/"), (
+                "content 应存落盘后的相对URL"
+            )
+            assert row.image_hash, "image_hash 应存图片MD5"
+
+    async def test_重复图片按字节哈希跳过(self, api, seed_card, async_session):
+        """验证同字节图片（含批次内重复与跨批次重复）被跳过，计入 skipped。"""
+        card = await seed_card()
+
+        first = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images", files=_files(b"a1")
+        )
+        assert first.json()["data"] == {"added": 1, "skipped": 0}
+
+        # 第二批：a1 与存量重复，a2 批次内重复，仅 a3 全新
+        resp = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images",
+            files=_files(b"a1", b"a2", b"a2", b"a3"),
+        )
+
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"] == {"added": 2, "skipped": 2}, (
+            "存量重复与批次内重复的图片应跳过"
+        )
+
+        from common.services import card_secret_service
+        assert await card_secret_service.stock_of(async_session, card.id) == 3
+
+    async def test_未登录上传被拒绝(self, api, seed_card):
+        """验证匿名请求上传图片返回 401。"""
+        card = await seed_card()
+        api.app.dependency_overrides.pop(api.deps.get_current_active_user, None)
+        api.app.dependency_overrides.pop(api.deps.get_current_user, None)
+
+        resp = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images", files=_files(b"a1")
+        )
+        assert resp.status_code == 401, "匿名上传应返回 401"
+
+    async def test_他人或不存在分类被拒绝(self, api, seed_card):
+        """验证他人 card_id / 不存在 card_id 返回 403/404，不泄露存在性。"""
+        other_card = await seed_card(user_id=99)
+        api.user.id = 1
+
+        resp_missing = await api.client.post(
+            "/cards/999999/secrets/batch-images", files=_files(b"a1")
+        )
+        resp_foreign = await api.client.post(
+            f"/cards/{other_card.id}/secrets/batch-images", files=_files(b"a1")
+        )
+
+        for resp in (resp_missing, resp_foreign):
+            body = resp.json()
+            assert body["success"] is False, "不存在/无权限的分类应拒绝导入"
+            assert body["code"] in (403, 404), "错误码应为 403 或 404"
+
+    async def test_非data型卡券拒绝导入(self, api, seed_card):
+        """验证 text/image/api 型卡券不接受卡密图片导入（仅 data 型分类可导入）。"""
+        text_card = await seed_card(type="text", text_content="说明")
+
+        resp = await api.client.post(
+            f"/cards/{text_card.id}/secrets/batch-images", files=_files(b"a1")
+        )
+
+        body = resp.json()
+        assert body["success"] is False, "非 data 型卡券应拒绝导入"
+        assert body["code"] == 400, "错误码应为 400"
+
+    async def test_非图片文件被拒绝(self, api, seed_card):
+        """验证 content_type 非 image/* 的文件返回 400 及明确错误信息。"""
+        card = await seed_card()
+
+        resp = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images",
+            files=[("files", ("evil.txt", b"not an image", "text/plain"))],
+        )
+
+        body = resp.json()
+        assert body["success"] is False, "非图片文件应拒绝"
+        assert body["code"] == 400, "错误码应为 400"
+        assert body["message"], "应返回明确错误信息"
+
+    async def test_单批超过50张被拒绝(self, api, seed_card):
+        """验证单批上传数量上限（50 张），超出返回 400。"""
+        card = await seed_card()
+        files = [
+            ("files", (f"qr_{i}.png", _png(f"b{i}".encode()), "image/png"))
+            for i in range(51)
+        ]
+
+        resp = await api.client.post(
+            f"/cards/{card.id}/secrets/batch-images", files=files
+        )
+
+        body = resp.json()
+        assert body["success"] is False, "单批超过 50 张应拒绝"
+        assert body["code"] == 400, "错误码应为 400"

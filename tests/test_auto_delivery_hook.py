@@ -13,7 +13,9 @@
         order_id: str,
         buyer_id: str,
         account_id: str,
-        send_message,    # async (buyer_id, content) 注入的 IM 发送
+        send_message,    # async (buyer_id, content) 注入的 IM 文本发送
+        send_image=None, # 可选 async (buyer_id, image_url) 注入的图片消息发送；
+                         # 取到 content_type=1 的二维码图片卡密时改用此通道
         enqueue_task,    # async (payload: dict) 注入的 Redis 任务投递
         notify,          # async (message: str) 注入的卖家通知
         confirm_delivery=None,  # 可选 async () 确认发货回调，失败同样回滚卡密
@@ -302,3 +304,98 @@ class TestDeliveryFailureNoConsume:
         await async_session.refresh(rows[0])
         assert rows[0].status == 0, "确认发货失败后已取卡密应回滚为可用"
         assert rows[0].order_id is None
+
+
+class TestImageSecretDelivery:
+    """图片卡密（content_type=1）发货：走图片消息链路而非文本消息（方案 §3.2）。"""
+
+    async def _seed_image_secret(self, async_session, card):
+        """写入一条可用的二维码图片卡密并返回。"""
+        # TDD：CardSecret 模型实现前，此处 ImportError 即红灯
+        from common.models.card_secret import CardSecret
+
+        row = CardSecret(
+            card_id=card.id,
+            user_id=card.user_id,
+            content="/static/uploads/card_secrets/qr_1.png",
+            content_type=1,
+            image_hash="h" * 32,
+            status=0,
+        )
+        async_session.add(row)
+        await async_session.commit()
+        await async_session.refresh(row)
+        return row
+
+    async def test_取到图片卡密时发送图片消息而非文本(
+        self, async_session, seed_card, hook_module,
+        mock_im_sender, mock_image_sender, mock_task_queue, mock_notifier,
+    ):
+        """验证 content_type=1 的卡密改走 send_image 通道，发送内容为图片URL。"""
+        card = await seed_card()
+        secret = await self._seed_image_secret(async_session, card)
+
+        sent = await hook_module.deliver_data_card_secret(
+            async_session, card=card, item_id="ITEM001", order_id="ORDER001",
+            buyer_id="BUYER1", account_id="ACC001",
+            send_message=mock_im_sender,
+            send_image=mock_image_sender,
+            enqueue_task=mock_task_queue,
+            notify=mock_notifier,
+        )
+
+        assert sent is True
+        mock_image_sender.assert_awaited_once(), "图片卡密应走图片消息通道"
+        call = mock_image_sender.call_args
+        sent_url = call.args[1] if len(call.args) > 1 else call.kwargs.get("image_url")
+        assert sent_url == secret.content, "图片消息应发送卡密中的图片URL"
+        mock_im_sender.assert_not_awaited(), "图片卡密不应再走文本消息通道"
+        await async_session.refresh(secret)
+        assert secret.status == 1 and secret.order_id == "ORDER001", (
+            "发出的图片卡密应置为已用并记录订单号"
+        )
+
+    async def test_图片发送失败后卡密回滚为可用(
+        self, async_session, seed_card, hook_module,
+        mock_im_sender, mock_image_sender, mock_task_queue, mock_notifier,
+    ):
+        """验证图片消息发送异常时调用 release，卡密复位可用且不投递上下架任务。"""
+        card = await seed_card()
+        secret = await self._seed_image_secret(async_session, card)
+        mock_image_sender.side_effect = Exception("图片上传闲鱼CDN失败")
+
+        with pytest.raises(Exception, match="图片上传闲鱼CDN失败"):
+            await hook_module.deliver_data_card_secret(
+                async_session, card=card, item_id="ITEM001", order_id="ORDER001",
+                buyer_id="BUYER1", account_id="ACC001",
+                send_message=mock_im_sender,
+                send_image=mock_image_sender,
+                enqueue_task=mock_task_queue,
+                notify=mock_notifier,
+            )
+
+        await async_session.refresh(secret)
+        assert secret.status == 0, "图片发送失败后卡密应回滚为可用"
+        assert secret.order_id is None, "回滚后订单号应清空"
+        mock_task_queue.assert_not_awaited(), "发货失败不应投递上下架任务"
+
+    async def test_文本卡密不触发图片发送通道(
+        self, async_session, seed_card, seed_secrets, hook_module,
+        mock_im_sender, mock_image_sender, mock_task_queue, mock_notifier,
+    ):
+        """验证 content_type=0 的文本卡密仍走文本通道，send_image 不被调用。"""
+        card = await seed_card()
+        await seed_secrets(card.id, n=1, content_prefix="TEXT")
+
+        sent = await hook_module.deliver_data_card_secret(
+            async_session, card=card, item_id="ITEM001", order_id="ORDER001",
+            buyer_id="BUYER1", account_id="ACC001",
+            send_message=mock_im_sender,
+            send_image=mock_image_sender,
+            enqueue_task=mock_task_queue,
+            notify=mock_notifier,
+        )
+
+        assert sent is True
+        mock_im_sender.assert_awaited_once(), "文本卡密应走文本消息通道"
+        mock_image_sender.assert_not_awaited(), "文本卡密不应触发图片发送通道"
